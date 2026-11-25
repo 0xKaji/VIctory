@@ -243,12 +243,24 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Number of pipeline worker threads: `VICTORY_PIPELINE_WORKERS` (clamped
+/// to `1..=16`), or half the logical processors (`2..=8`).
+fn worker_count(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16))
+        .unwrap_or_else(|| (cpus / 2).clamp(2, 8))
+}
+
+/// Hands `p` to the workers (half the logical processors, 2 to 8, unless
+/// `VICTORY_PIPELINE_WORKERS` overrides it), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let n = worker_count(
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
+            cpus,
+        );
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -368,5 +380,16 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn worker_count_respects_override_and_clamps() {
+        assert_eq!(worker_count(None, 16), 8);
+        assert_eq!(worker_count(None, 2), 2);
+        assert_eq!(worker_count(Some("1"), 16), 1);
+        assert_eq!(worker_count(Some("2"), 16), 2);
+        assert_eq!(worker_count(Some("0"), 16), 1);
+        assert_eq!(worker_count(Some("99"), 16), 16);
+        assert_eq!(worker_count(Some("abc"), 16), 8);
     }
 }
