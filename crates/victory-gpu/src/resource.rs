@@ -1086,6 +1086,9 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
     // formats must match block size and texels-per-block, so these cannot be
     // cast with 16-bit 1x1 formats.
     const SUBSAMPLED_422: [u32; 2] = [68, 69];
+    if SUBSAMPLED_422.contains(&format) {
+        return Vec::new();
+    }
     let Some(e) = element(format) else {
         return Vec::new();
     };
@@ -1967,6 +1970,7 @@ mod tests {
         }
         let u16_like = castable(48);
         assert!(!u16_like.contains(&68) && !u16_like.contains(&69));
+        assert!(castable(68).is_empty() && castable(69).is_empty());
         let bc1 = castable(71);
         assert!(bc1.contains(&72) && bc1.contains(&80) && bc1.contains(&81));
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
