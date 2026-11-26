@@ -23,8 +23,9 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<std::collections::HashMap<u32, u64>>,
+    /// The record (view index and generation) each slot was last made from,
+    /// allocated lazily on the first mirrored view so unused heaps take 0 bytes.
+    made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -176,7 +177,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(std::collections::HashMap::new()),
+            made: Mutex::new(Vec::new()),
             kept: Mutex::new(std::collections::HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -451,6 +452,9 @@ impl HostHeap {
             }
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
+        // `buffer.is_none()` is used only for null fallback/sentinel slots
+        // (`NULL_BUFFER_VIEW` and null raw pairs), where stride 0 ("no buffer
+        // view") is accurate and avoids allocating `strides` on empty heaps.
         self.write_stride(index, if buffer.is_some() { 4 } else { 0 });
         self.set_mark(index, None);
         // Not a title view: no entry an earlier table left there stays.
@@ -603,9 +607,9 @@ impl HostHeap {
                 write_address(data, i as usize, None);
             }
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (&i, &key) in made.iter() {
+            for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i as usize, view.as_ref());
+                write_address(data, i, view.as_ref());
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -725,10 +729,11 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(&i) {
+                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
                     Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(_) => true,
-                    None => current,
+                    Some(&m) => m != 0,
+                    None if i < self.count => current,
+                    None => true,
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -766,7 +771,8 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made.remove(&index).is_some() {
+            if made.get(index as usize).copied().unwrap_or(0) != 0 {
+                made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
             }
@@ -801,7 +807,7 @@ impl HostHeap {
                     })
                 })
         };
-        if made.get(&index) == Some(&key) && !needs_remake() {
+        if made.get(index as usize).copied().unwrap_or(0) == key && !needs_remake() {
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -825,7 +831,7 @@ impl HostHeap {
                 drop(made);
                 return self.mirror(index, handle, for_draw);
             }
-            if made.get(&index) == Some(&key) && !needs_remake() {
+            if made.get(index as usize).copied().unwrap_or(0) == key && !needs_remake() {
                 return Some(view);
             }
         }
@@ -836,7 +842,10 @@ impl HostHeap {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
-            made.insert(index, key);
+            if made.is_empty() {
+                made.resize(self.count as usize, 0);
+            }
+            made[index as usize] = key;
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -862,7 +871,7 @@ impl HostHeap {
         if index >= self.count {
             return None;
         }
-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied().unwrap_or(0);
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
@@ -899,7 +908,7 @@ impl HostHeap {
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
-            let key = made.get(&index).copied().unwrap_or(0);
+            let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
                 Some(v) => null_for(v, self.cpu(index)),
@@ -926,7 +935,7 @@ impl HostHeap {
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index)?;
+        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
         (is_placed_texture(&view) && !kept).then_some(view)
@@ -935,7 +944,7 @@ impl HostHeap {
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied().unwrap_or(0);
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
@@ -950,7 +959,7 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index)
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0) != 0
     }
 
     /// Whether slot `index` holds a host view of a resource (tests).
@@ -2494,7 +2503,9 @@ mod tests {
         assert!(heap.marks.get().is_none());
         assert!(heap.made.lock().unwrap().is_empty());
         heap.make_null(0);
+        heap.raw_view_at(0, None, 0, 0, false);
         assert!(heap.strides.get().is_none());
         assert!(heap.marks.get().is_none());
+        assert!(heap.made.lock().unwrap().is_empty());
     }
 }
