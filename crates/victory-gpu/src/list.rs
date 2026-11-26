@@ -279,6 +279,7 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
+        list.release_idle_buffers();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
             spare.push(list);
