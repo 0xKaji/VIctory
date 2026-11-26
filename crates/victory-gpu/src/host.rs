@@ -642,6 +642,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scratch_chunks_trim_after_idle_window() {
+        let (mut peak, mut window) = (0, 0);
+        assert_eq!(trim_scratch(12, 1, &mut peak, &mut window), SCRATCH_KEEP);
+        for _ in 1..SCRATCH_IDLE_RESETS - 1 {
+            assert_eq!(trim_scratch(8, 1, &mut peak, &mut window), 8);
+        }
+        assert_eq!(trim_scratch(8, 1, &mut peak, &mut window), SCRATCH_SPARE);
+        assert_eq!((peak, window), (0, 0));
+
+        for i in 0..SCRATCH_IDLE_RESETS - 1 {
+            let used = if i == 5 { 4 } else { 1 };
+            assert_eq!(trim_scratch(8, used, &mut peak, &mut window), 8);
+        }
+        assert_eq!(trim_scratch(8, 1, &mut peak, &mut window), 4);
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -950,6 +967,8 @@ struct Scratch {
     chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
+    peak_used: usize,
+    window: u32,
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -957,6 +976,23 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+const SCRATCH_KEEP: usize = 8;
+const SCRATCH_SPARE: usize = 1;
+const SCRATCH_IDLE_RESETS: u32 = 64;
+
+fn trim_scratch(len: usize, used_chunks: usize, peak_used: &mut usize, window: &mut u32) -> usize {
+    let len = len.min(SCRATCH_KEEP);
+    *peak_used = (*peak_used).max(used_chunks);
+    *window += 1;
+    if *window >= SCRATCH_IDLE_RESETS {
+        let keep = (*peak_used).max(SCRATCH_SPARE).min(SCRATCH_KEEP);
+        *peak_used = 0;
+        *window = 0;
+        len.min(keep)
+    } else {
+        len
+    }
+}
 
 struct ScratchChunk {
     _buffer: ID3D12Resource,
@@ -1791,7 +1827,16 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let scratch = &mut *scratch;
+            let used_chunks = scratch.current + usize::from(scratch.used > 0);
             (scratch.current, scratch.used) = (0, 0);
+            let keep = trim_scratch(
+                scratch.chunks.len(),
+                used_chunks,
+                &mut scratch.peak_used,
+                &mut scratch.window,
+            );
+            scratch.chunks.truncate(keep);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
