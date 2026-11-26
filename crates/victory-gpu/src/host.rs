@@ -1818,13 +1818,37 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.clear();
+            if states.capacity() > 256 {
+                states.shrink_to(64);
+            }
+        }
+        {
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            twins.clear();
+            if twins.capacity() > 256 {
+                twins.shrink_to(64);
+            }
+        }
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            notes.clear();
+            if notes.capacity() > 256 {
+                notes.shrink_to(64);
+            }
+        }
         #[cfg(feature = "diagnostics")]
-        self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+            targets.clear();
+            if targets.capacity() > 256 {
+                targets.shrink_to(64);
+            }
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             let scratch = &mut *scratch;
