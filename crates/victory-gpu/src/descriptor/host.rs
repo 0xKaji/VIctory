@@ -24,7 +24,7 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: Mutex<std::collections::HashMap<u32, u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -42,14 +42,14 @@ pub(crate) struct HostHeap {
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
-    /// address kept beside it.
-    strides: Option<(ID3D12Resource, usize)>,
+    /// address kept beside it, made on first use.
+    strides: std::sync::OnceLock<Option<(ID3D12Resource, usize)>>,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
     /// stride table has one: the mark bit and phase of the unordered buffer
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
-    /// beside it.
-    marks: Option<(ID3D12Resource, usize)>,
+    /// beside it, made on first use.
+    marks: std::sync::OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Per title slot and per dynamic slot (tables made afresh lie there,
     /// and shaders index the view addresses at the slots their tables are
     /// in), the console descriptor's dwords 0-3 as far as the host knows
@@ -119,24 +119,6 @@ impl HostHeap {
                     })
             }
         };
-        // Every slot a shader can index (title slots, also past a capped
-        // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
-        let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
-            .flatten()
-            .map(|(buffer, data)| (buffer, data as usize));
-        let marks = (!sampler)
-            .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
-                let (buffer, data) = host.upload_buffer(bytes)?;
-                crate::host::name(&buffer, || "view marks".into());
-                // Every slot unmarked (all ones) until a view is made there.
-                // SAFETY: our mapped buffer of `bytes` bytes.
-                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
-                Some((buffer, data as usize))
-            })
-            .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
@@ -194,7 +176,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(std::collections::HashMap::new()),
             kept: Mutex::new(std::collections::HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -202,8 +184,8 @@ impl HostHeap {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
-            strides,
-            marks,
+            strides: std::sync::OnceLock::new(),
+            marks: std::sync::OnceLock::new(),
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
         };
@@ -491,6 +473,38 @@ impl HostHeap {
         }
     }
 
+    fn strides_buf(&self) -> Option<&(ID3D12Resource, usize)> {
+        self.strides
+            .get_or_init(|| {
+                if self.sampler {
+                    return None;
+                }
+                let bytes = u64::from(self.count.max(victory_shader::emit::HEAP_VIEWS)) * 4;
+                let (buffer, data) = host()?.upload_buffer(bytes)?;
+                // SAFETY: our mapped buffer of `bytes` bytes.
+                unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+                Some((buffer, data as usize))
+            })
+            .as_ref()
+    }
+
+    fn marks_buf(&self) -> Option<&(ID3D12Resource, usize)> {
+        self.marks
+            .get_or_init(|| {
+                if self.sampler {
+                    return None;
+                }
+                let bytes = u64::from(self.count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let (buffer, data) = host()?.upload_buffer(bytes)?;
+                crate::host::name(&buffer, || "view marks".into());
+                // Every slot unmarked (all ones) until a view is made there.
+                // SAFETY: our mapped buffer of `bytes` bytes.
+                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
+                Some((buffer, data as usize))
+            })
+            .as_ref()
+    }
+
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table, with the integer-format
     /// bits of a typed buffer view ([`view_kind`]).
@@ -499,7 +513,10 @@ impl HostHeap {
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
-        let Some((_, data)) = &self.strides else { return };
+        if stride == 0 && self.strides.get().is_none() {
+            return;
+        }
+        let Some((_, data)) = self.strides_buf() else { return };
         if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
             return;
         }
@@ -510,14 +527,17 @@ impl HostHeap {
 
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
-        self.strides.as_ref().map(|(buffer, _)| buffer)
+        self.strides_buf().map(|(buffer, _)| buffer)
     }
 
     /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
     /// unordered buffer view there ([`crate::shadow::Shadow::mark_entry`]),
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
-        let Some((_, data)) = &self.marks else { return };
+        if entry.is_none() && self.marks.get().is_none() {
+            return;
+        }
+        let Some((_, data)) = self.marks_buf() else { return };
         if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
             return;
         }
@@ -533,7 +553,7 @@ impl HostHeap {
 
     /// The view-mark table, for the root SRV of shaders marking their writes.
     pub(crate) fn marks(&self) -> Option<&ID3D12Resource> {
-        self.marks.as_ref().map(|(buffer, _)| buffer)
+        self.marks_buf().map(|(buffer, _)| buffer)
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -579,15 +599,13 @@ impl HostHeap {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
-            }
-            // Dynamic slots are entered as they are made ([`Self::make_at`],
-            // [`Self::make_null`], raw views).
-            for i in self.count..self.address_slots() {
+            for i in 0..self.address_slots() {
                 write_address(data, i as usize, None);
+            }
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for (&i, &key) in made.iter() {
+                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+                write_address(data, i as usize, view.as_ref());
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -707,10 +725,10 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
+                .filter(|&(i, (&[_, view, generation], current))| match made.get(&i) {
                     Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                    Some(_) => true,
+                    None => current,
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -748,8 +766,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.remove(&index).is_some() {
                 self.make_null(index);
                 self.note_address(index, None);
             }
@@ -784,7 +801,7 @@ impl HostHeap {
                     })
                 })
         };
-        if made[index as usize] == key && !needs_remake() {
+        if made.get(&index) == Some(&key) && !needs_remake() {
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -808,7 +825,7 @@ impl HostHeap {
                 drop(made);
                 return self.mirror(index, handle, for_draw);
             }
-            if made[index as usize] == key && !needs_remake() {
+            if made.get(&index) == Some(&key) && !needs_remake() {
                 return Some(view);
             }
         }
@@ -819,7 +836,7 @@ impl HostHeap {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
-            made[index as usize] = key;
+            made.insert(index, key);
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -842,7 +859,10 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        if index >= self.count {
+            return None;
+        }
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied().unwrap_or(0);
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
@@ -879,7 +899,7 @@ impl HostHeap {
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
-            let key = made.get(index as usize).copied().unwrap_or(0);
+            let key = made.get(&index).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
                 Some(v) => null_for(v, self.cpu(index)),
@@ -906,7 +926,7 @@ impl HostHeap {
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
         (is_placed_texture(&view) && !kept).then_some(view)
@@ -915,7 +935,7 @@ impl HostHeap {
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied().unwrap_or(0);
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
@@ -930,7 +950,7 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index)
     }
 
     /// Whether slot `index` holds a host view of a resource (tests).
@@ -2464,5 +2484,17 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn empty_view_heap_defers_stride_and_mark_tables() {
+        let Some(_) = host() else { return };
+        let heap = HostHeap::new(false, 1024).expect("view heap");
+        assert!(heap.strides.get().is_none());
+        assert!(heap.marks.get().is_none());
+        assert!(heap.made.lock().unwrap().is_empty());
+        heap.make_null(0);
+        assert!(heap.strides.get().is_none());
+        assert!(heap.marks.get().is_none());
     }
 }
