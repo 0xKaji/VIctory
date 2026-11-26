@@ -417,6 +417,7 @@ mod tests {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
         let shader = Arc::new(Shader {
             stage: "compute",
+            full_hash: [0; 32],
             hash: "0123456789abcdef".into(),
             container_len: 0,
             container: Mutex::new(Vec::new()),

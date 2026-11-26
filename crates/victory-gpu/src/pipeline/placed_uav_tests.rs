@@ -77,12 +77,14 @@ fn store_shader() -> Arc<Shader> {
     let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
     Arc::new(Shader {
         stage: "compute",
+        full_hash: [0; 32],
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
         container_len: container.len(),
         container: std::sync::Mutex::new(container),
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,
+            atomics64: false,
         })),
     })
 }

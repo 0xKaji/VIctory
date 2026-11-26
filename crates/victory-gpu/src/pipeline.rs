@@ -60,6 +60,7 @@ pub(crate) struct ComputeHead {
 /// same bytes.
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
+    full_hash: [u8; 32],
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container_len: usize,
@@ -98,9 +99,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        let full = blake3::hash(bytes);
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            full_hash: *full.as_bytes(),
+            hash: full.to_hex()[..16].to_owned(),
             container_len: bytes.len(),
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
@@ -121,7 +124,67 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) atomics64: bool,
 }
+
+#[cfg(windows)]
+fn has_atomics64(dxil: &[u8]) -> bool {
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::SFI0)?
+                .data
+                .get(..4)?
+                .try_into()
+                .ok()
+        })
+        .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+}
+
+#[cfg(windows)]
+const DXIL_CACHE_BYTES: usize = 32 << 20;
+
+#[cfg(windows)]
+struct DxilCache {
+    entries: HashMap<[u8; 32], Arc<[u8]>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    bytes: usize,
+    cap: usize,
+}
+
+#[cfg(windows)]
+impl DxilCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<[u8]>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: [u8; 32], dxil: Arc<[u8]>) {
+        if dxil.len() > self.cap || self.entries.contains_key(&key) {
+            return;
+        }
+        self.bytes += dxil.len();
+        self.entries.insert(key, dxil);
+        self.order.push_back(key);
+        while self.bytes > self.cap {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&old) {
+                self.bytes -= removed.len();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+static DXIL_CACHE: Mutex<Option<DxilCache>> = Mutex::new(None);
 
 #[cfg(windows)]
 impl Shader {
@@ -131,10 +194,12 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let container = std::mem::take(
-                    &mut *self.container.lock().unwrap_or_else(|e| e.into_inner()),
-                );
-                let (done, cached) = translate(&container);
+                let container = self
+                    .container
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let (mut done, cached) = translate(&container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -149,20 +214,71 @@ impl Shader {
                         kernel_ms,
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        std::mem::take(
+                            &mut *self.container.lock().unwrap_or_else(|e| e.into_inner()),
+                        );
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
+                }
+                if let Ok(t) = &mut done
+                    && !t.host.dxil.is_empty()
+                    && !container.is_empty()
+                {
+                    let dxil: Arc<[u8]> = Arc::from(std::mem::take(&mut t.host.dxil));
+                    DXIL_CACHE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| DxilCache::new(DXIL_CACHE_BYTES))
+                        .insert(self.full_hash, dxil);
                 }
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Translated DXIL bytecode, from the bounded RAM cache or reloaded from
+    /// the disk shader cache if evicted.
+    pub(crate) fn dxil(&self) -> Option<Arc<[u8]>> {
+        let t = self.translated()?;
+        if !t.host.dxil.is_empty() {
+            return Some(Arc::from(t.host.dxil.as_slice()));
+        }
+        if let Some(dxil) = DXIL_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|c| c.get(&self.full_hash))
+        {
+            return Some(dxil);
+        }
+        let container = self
+            .container
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if container.is_empty() {
+            return None;
+        }
+        let (Ok(host), _) = crate::shader_cache::host_shader(&container) else {
+            return None;
+        };
+        let dxil: Arc<[u8]> = Arc::from(host.dxil);
+        DXIL_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| DxilCache::new(DXIL_CACHE_BYTES))
+            .insert(self.full_hash, dxil.clone());
+        Some(dxil)
     }
 }
 
@@ -201,6 +317,7 @@ fn with_resources(
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
+    let atomics64 = has_atomics64(&host.dxil);
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -216,7 +333,7 @@ fn with_resources(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(Translated { host, used, atomics64 })
 }
 
 #[repr(C)]
@@ -919,6 +1036,20 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(s);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_cache_evicts_oldest_past_cap() {
+        let mut cache = DxilCache::new(16);
+        let (k1, k2, k3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        cache.insert(k1, Arc::from([0u8; 8].as_slice()));
+        cache.insert(k2, Arc::from([0u8; 8].as_slice()));
+        assert!(cache.get(&k1).is_some() && cache.get(&k2).is_some());
+        cache.insert(k3, Arc::from([0u8; 8].as_slice()));
+        assert!(cache.get(&k1).is_none());
+        assert!(cache.get(&k2).is_some() && cache.get(&k3).is_some());
+        assert_eq!(cache.bytes, 16);
     }
 }
 
