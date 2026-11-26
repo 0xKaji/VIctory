@@ -205,7 +205,7 @@ fn trim_target(len: usize, used_chunks: usize, peak_used: &mut usize, window: &m
     *peak_used = (*peak_used).max(used_chunks);
     *window += 1;
     if *window >= IDLE_SUBMISSIONS {
-        let keep = (*peak_used).max(SPARE_CHUNKS).min(CHUNKS_KEPT);
+        let keep = (*peak_used).clamp(SPARE_CHUNKS, CHUNKS_KEPT);
         *peak_used = 0;
         *window = 0;
         len.min(keep)

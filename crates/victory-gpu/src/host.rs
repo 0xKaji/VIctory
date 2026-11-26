@@ -985,7 +985,7 @@ fn trim_scratch(len: usize, used_chunks: usize, peak_used: &mut usize, window: &
     *peak_used = (*peak_used).max(used_chunks);
     *window += 1;
     if *window >= SCRATCH_IDLE_RESETS {
-        let keep = (*peak_used).max(SCRATCH_SPARE).min(SCRATCH_KEEP);
+        let keep = (*peak_used).clamp(SCRATCH_SPARE, SCRATCH_KEEP);
         *peak_used = 0;
         *window = 0;
         len.min(keep)
