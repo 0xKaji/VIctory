@@ -119,7 +119,7 @@ impl PageBits {
         let start = from.max(self.base);
         let limit = self.base + self.words.len() * 64;
         let end = to.min(limit);
-        if start >= end {
+        if self.is_empty() || start >= end {
             return out;
         }
         let first_rel = start - self.base;
