@@ -126,8 +126,8 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         topology: [u32; 2],
         dsv: [u32; 2],
     }
-    let shader_bytes = shader.container.lock().unwrap();
-    let ps_bytes = ps.as_ref().map(|ps| ps.container.lock().unwrap());
+    let shader_bytes = shader.container_bytes();
+    let ps_bytes = ps.as_ref().map(|ps| ps.container_bytes());
     let stream = Stream {
         shader_kind: if mesh { 24 } else { 1 },
         shader: Bytecode { code: shader_bytes.as_ptr(), size: shader_bytes.len() },

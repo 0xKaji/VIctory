@@ -420,7 +420,7 @@ mod tests {
             full_hash: [0; 32],
             hash: "0123456789abcdef".into(),
             container_len: 0,
-            container: Mutex::new(Vec::new()),
+            container: Mutex::new(crate::pipeline::Container::Empty),
             translated: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

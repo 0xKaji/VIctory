@@ -58,13 +58,34 @@ pub(crate) struct ComputeHead {
 
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
+pub(crate) enum Container {
+    Empty,
+    Raw(Vec<u8>),
+    Compressed(Vec<u8>),
+}
+
+const COMPRESS_MIN_BYTES: usize = 1024;
+
+fn pack_container(bytes: &[u8]) -> Container {
+    if bytes.is_empty() {
+        return Container::Empty;
+    }
+    if bytes.len() >= COMPRESS_MIN_BYTES {
+        let deflated = miniz_oxide::deflate::compress_to_vec(bytes, 1);
+        if deflated.len() < bytes.len() {
+            return Container::Compressed(deflated);
+        }
+    }
+    Container::Raw(bytes.to_vec())
+}
+
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     full_hash: [u8; 32],
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container_len: usize,
-    container: Mutex<Vec<u8>>,
+    container: Mutex<Container>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -105,9 +126,19 @@ impl Shader {
             full_hash: *full.as_bytes(),
             hash: full.to_hex()[..16].to_owned(),
             container_len: bytes.len(),
-            container: Mutex::new(bytes.to_vec()),
+            container: Mutex::new(pack_container(bytes)),
             #[cfg(windows)]
             translated: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn container_bytes(&self) -> Vec<u8> {
+        match &*self.container.lock().unwrap_or_else(|e| e.into_inner()) {
+            Container::Empty => Vec::new(),
+            Container::Raw(bytes) => bytes.clone(),
+            Container::Compressed(deflated) => {
+                miniz_oxide::inflate::decompress_to_vec(deflated).unwrap_or_default()
+            }
         }
     }
 
@@ -194,11 +225,7 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let container = self
-                    .container
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let container = self.container_bytes();
                 let (mut done, cached) = translate(&container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
@@ -215,9 +242,7 @@ impl Shader {
                         "shader translated"
                     ),
                     Err(e) => {
-                        std::mem::take(
-                            &mut *self.container.lock().unwrap_or_else(|e| e.into_inner()),
-                        );
+                        *self.container.lock().unwrap_or_else(|e| e.into_inner()) = Container::Empty;
                         tracing::warn!(
                             stage = self.stage,
                             hash = %self.hash,
@@ -261,11 +286,7 @@ impl Shader {
         {
             return Some(dxil);
         }
-        let container = self
-            .container
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let container = self.container_bytes();
         if container.is_empty() {
             return None;
         }
@@ -873,7 +894,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.lock().unwrap_or_else(|e| e.into_inner()).clone()))
+            .map(|s| (s.stage, s.container_bytes()))
             .collect()
     }
 
@@ -1050,6 +1071,19 @@ mod tests {
         assert!(cache.get(&k1).is_none());
         assert!(cache.get(&k2).is_some() && cache.get(&k3).is_some());
         assert_eq!(cache.bytes, 16);
+    }
+
+    #[test]
+    fn large_shader_containers_are_stored_compressed() {
+        let raw = vec![0x42u8; 8192];
+        let s = Shader::new("pixel", &raw);
+        let stored_len = match &*s.container.lock().unwrap() {
+            Container::Compressed(c) => c.len(),
+            Container::Raw(r) => panic!("expected compressed, got raw {}", r.len()),
+            Container::Empty => panic!("expected compressed, got empty"),
+        };
+        assert!(stored_len < raw.len());
+        assert_eq!(s.container_bytes(), raw);
     }
 }
 
