@@ -104,6 +104,15 @@ static SHADERS: Mutex<Option<(usize, HashMap<[u8; 32], Weak<Shader>>)>> = Mutex:
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    {
+        let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, map) = shaders.get_or_insert_with(|| (0, HashMap::new()));
+        if let Some(existing) = map.get(full.as_bytes()).and_then(Weak::upgrade) {
+            return existing;
+        }
+    }
+    // Hash once and compress outside the global `SHADERS` lock.
+    let created = Arc::new(Shader::new_with_hash(stage, bytes, full));
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = shaders.get_or_insert_with(|| (0, HashMap::new()));
     if let Some(existing) = map.get(full.as_bytes()).and_then(Weak::upgrade) {
@@ -113,14 +122,16 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
-    let created = Arc::new(Shader::new(stage, bytes));
     map.insert(*full.as_bytes(), Arc::downgrade(&created));
     created
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
-        let full = blake3::hash(bytes);
+        Self::new_with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn new_with_hash(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
             full_hash: *full.as_bytes(),
@@ -242,6 +253,9 @@ impl Shader {
                         "shader translated"
                     ),
                     Err(e) => {
+                        // `self.translated`'s `OnceLock` caches `None` for the
+                        // rest of the shader's life, so `container_bytes()` is
+                        // never needed again.
                         *self.container.lock().unwrap_or_else(|e| e.into_inner()) = Container::Empty;
                         tracing::warn!(
                             stage = self.stage,
@@ -255,8 +269,16 @@ impl Shader {
                         );
                     }
                 }
+                // Only evict DXIL to the bounded cache when a disk shader cache
+                // is active (`counts` > 0) and the DXIL fits in the cap; without
+                // a disk cache or for oversized DXIL, keep it resident to avoid
+                // re-translation during pipeline creation.
+                let (hits, misses) = crate::shader_cache::counts();
+                let has_disk_cache = hits + misses > 0;
                 if let Ok(t) = &mut done
+                    && has_disk_cache
                     && !t.host.dxil.is_empty()
+                    && t.host.dxil.len() <= DXIL_CACHE_BYTES
                     && !container.is_empty()
                 {
                     let dxil: Arc<[u8]> = Arc::from(std::mem::take(&mut t.host.dxil));
@@ -1084,6 +1106,39 @@ mod tests {
         };
         assert!(stored_len < raw.len());
         assert_eq!(s.container_bytes(), raw);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_stays_resident_when_not_evicted() {
+        let mut cache = DxilCache::new(8);
+        cache.insert([9u8; 32], Arc::from([1u8; 16].as_slice()));
+        assert!(cache.get(&[9u8; 32]).is_none(), "oversized DXIL is not cached");
+
+        let shader = Shader::for_test(
+            "pixel",
+            Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: victory_shader::HwStage::Ps,
+                    dxil: vec![1, 2, 3, 4],
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: Vec::new(),
+                atomics64: false,
+            },
+        );
+        assert_eq!(shader.dxil().as_deref(), Some(&[1, 2, 3, 4][..]));
     }
 }
 
