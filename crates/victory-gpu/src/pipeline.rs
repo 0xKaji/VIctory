@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -62,7 +62,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    container_len: usize,
+    container: Mutex<Vec<u8>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -73,18 +74,26 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Every live container seen, by full content hash, with the size at which
+/// dead entries are pruned.
+#[allow(clippy::type_complexity)]
+static SHADERS: Mutex<Option<(usize, HashMap<[u8; 32], Weak<Shader>>)>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
-        .clone()
+    let (prune_at, map) = shaders.get_or_insert_with(|| (0, HashMap::new()));
+    if let Some(existing) = map.get(full.as_bytes()).and_then(Weak::upgrade) {
+        return existing;
+    }
+    if map.len() >= *prune_at {
+        map.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (2 * map.len()).max(1024);
+    }
+    let created = Arc::new(Shader::new(stage, bytes));
+    map.insert(*full.as_bytes(), Arc::downgrade(&created));
+    created
 }
 
 impl Shader {
@@ -92,7 +101,8 @@ impl Shader {
         Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
+            container_len: bytes.len(),
+            container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -121,7 +131,10 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let container = std::mem::take(
+                    &mut *self.container.lock().unwrap_or_else(|e| e.into_inner()),
+                );
+                let (done, cached) = translate(&container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -241,7 +254,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
     }
 }
 
@@ -743,7 +756,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container.lock().unwrap_or_else(|e| e.into_inner()).clone()))
             .collect()
     }
 
@@ -834,7 +847,8 @@ mod tests {
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            let graphics = pipeline(p).host.graphics.lock().unwrap();
+            let g = graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
@@ -889,13 +903,22 @@ mod tests {
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);
         assert_eq!(pre.key(), title.host.key);
-        let state = title.host.graphics.as_deref().unwrap().describe();
+        let state = title.host.graphics.lock().unwrap().as_deref().unwrap().describe();
         assert!(state.contains(r#"\"TEXCOORD\" 2 16 1 8 0 0"#), "{state}");
         assert_eq!(pre.describe(), format!("{:?}\t{state}", title.shaders));
         // Another state is another pipeline.
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn unreferenced_shaders_are_released_from_cache() {
+        let s = shader("pixel", b"unique-weak-shader-cache-test");
+        let weak = Arc::downgrade(&s);
+        assert!(weak.upgrade().is_some());
+        drop(s);
+        assert!(weak.upgrade().is_none());
     }
 }
 
