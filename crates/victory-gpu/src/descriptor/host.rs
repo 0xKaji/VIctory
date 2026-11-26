@@ -451,7 +451,7 @@ impl HostHeap {
             }
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
+        self.write_stride(index, if buffer.is_some() { 4 } else { 0 });
         self.set_mark(index, None);
         // Not a title view: no entry an earlier table left there stays.
         self.note_address(index, None);
