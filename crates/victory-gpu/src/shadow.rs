@@ -1265,10 +1265,12 @@ impl Arena {
         Some((chunk.buffer.clone(), (chunk.data + start as usize) as *mut u8, chunk.gpu + start, slice))
     }
 
-    /// A run goes back, joined to its free neighbours; empty chunks past
-    /// [`SPARE_CHUNKS`] (and any empty oversized chunk) are released.
+    /// A run goes back, joined to its free neighbours; if the returned chunk
+    /// became empty, release it immediately when oversized or when more than
+    /// [`SPARE_CHUNKS`] standard chunks are already empty.
     fn give_back(&mut self, slice: Slice) {
-        let Some(chunk) = self.chunks.iter_mut().find(|c| c.id == slice.chunk) else { return };
+        let Some(idx) = self.chunks.iter().position(|c| c.id == slice.chunk) else { return };
+        let chunk = &mut self.chunks[idx];
         let (mut at, mut n) = (slice.offset, slice.len);
         if let Some((&before, &m)) = chunk.free.range(..at).next_back()
             && before + m == at
@@ -1280,18 +1282,18 @@ impl Arena {
             n += m;
         }
         chunk.free.insert(at, n);
-        let mut spare = 0;
-        self.chunks.retain(|c| {
-            let empty = c.free.get(&0) == Some(&c.size);
-            if !empty {
-                return true;
-            }
-            if c.size != CHUNK {
-                return false;
-            }
-            spare += 1;
-            spare <= SPARE_CHUNKS
-        });
+        if chunk.free.get(&0) != Some(&chunk.size) {
+            return;
+        }
+        let oversized = chunk.size != CHUNK;
+        let empty_standard = self
+            .chunks
+            .iter()
+            .filter(|c| c.size == CHUNK && c.free.get(&0) == Some(&c.size))
+            .count();
+        if oversized || empty_standard > SPARE_CHUNKS {
+            self.chunks.swap_remove(idx);
+        }
     }
 }
 
