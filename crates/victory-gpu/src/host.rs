@@ -1828,7 +1828,27 @@ impl HostList {
         }
     }
 
-    /// Releases oversized buffers when a list is parked in the idle pool.
+    /// Trims only oversized buffers when a list stays in the hot spare pool
+    /// so normal indirect argument and scratch buffers are reused across frames.
+    pub(crate) fn trim_oversized_buffers(&self) {
+        const MAX_WARM_ARGUMENTS: u64 = 256 << 10;
+        const HOT_SCRATCH_CHUNKS: usize = 2;
+        {
+            let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: a plain query on a live buffer.
+            if arguments.as_ref().is_some_and(|b| unsafe { b.GetDesc() }.Width > MAX_WARM_ARGUMENTS) {
+                *arguments = None;
+            }
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if scratch.chunks.len() > HOT_SCRATCH_CHUNKS {
+            scratch.chunks.truncate(HOT_SCRATCH_CHUNKS);
+        }
+        scratch.current = 0;
+        scratch.used = 0;
+    }
+
+    /// Releases oversized buffers when a list is parked in the cold idle pool.
     pub(crate) fn release_idle_buffers(&self) {
         const IDLE_SCRATCH_SPARE: usize = 1;
         *self.arguments.lock().unwrap_or_else(|e| e.into_inner()) = None;
