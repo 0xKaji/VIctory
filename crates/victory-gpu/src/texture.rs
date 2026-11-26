@@ -747,7 +747,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // The largest textures' buffers are not kept.
-        const KEEP: usize = 8 << 20;
+        const KEEP: usize = 16 << 20;
         if self.0.capacity() <= KEEP {
             SCRATCH.set(std::mem::take(&mut self.0));
         }

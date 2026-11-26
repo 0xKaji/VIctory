@@ -96,11 +96,11 @@ pub(crate) struct Shadow {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults),
-/// trimmed periodically to recent peak demand.
+/// trimmed periodically to recent per-submission peak demand.
 #[derive(Default)]
 struct SnapshotPool {
     buffers: Vec<Vec<u8>>,
-    live_bytes: usize,
+    submission_bytes: usize,
     peak_bytes: usize,
     window: u32,
 }
@@ -119,13 +119,12 @@ impl SnapshotPool {
             None => Vec::with_capacity(n),
         };
         v.clear();
-        self.live_bytes += v.capacity();
-        self.peak_bytes = self.peak_bytes.max(self.live_bytes);
+        self.submission_bytes += v.capacity();
+        self.peak_bytes = self.peak_bytes.max(self.submission_bytes);
         v
     }
 
     fn give_back(&mut self, v: Vec<u8>) {
-        self.live_bytes = self.live_bytes.saturating_sub(v.capacity());
         self.buffers.push(v);
         self.trim_to(POOL_BYTES);
     }
@@ -140,10 +139,11 @@ impl SnapshotPool {
     }
 
     fn step_window(&mut self) {
+        self.submission_bytes = 0;
         self.window += 1;
         if self.window >= POOL_IDLE_SUBMISSIONS {
             let budget = self.peak_bytes.clamp(POOL_SPARE_BYTES, POOL_BYTES);
-            self.peak_bytes = self.live_bytes;
+            self.peak_bytes = 0;
             self.window = 0;
             self.trim_to(budget);
         }
@@ -152,7 +152,7 @@ impl SnapshotPool {
 
 static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
     buffers: Vec::new(),
-    live_bytes: 0,
+    submission_bytes: 0,
     peak_bytes: 0,
     window: 0,
 });
@@ -1711,6 +1711,8 @@ pub(crate) mod tests {
         let mut pool = SnapshotPool::default();
         let a = pool.take(32 << 20);
         let b = pool.take(32 << 20);
+        let leaked = pool.take(32 << 20);
+        drop(leaked);
         pool.give_back(a);
         pool.give_back(b);
         assert_eq!(pool.buffers.len(), 2);
@@ -1719,10 +1721,14 @@ pub(crate) mod tests {
             assert_eq!(pool.buffers.len(), 2);
         }
         pool.step_window();
-        assert_eq!(pool.buffers.len(), 2, "first window keeps peak 64 MiB");
+        assert_eq!(pool.buffers.len(), 2, "first window keeps peak 96 MiB");
         for _ in 0..POOL_IDLE_SUBMISSIONS {
             pool.step_window();
         }
-        assert_eq!(pool.buffers.len(), 1, "second idle window trims buffers above 32 MiB spare");
+        assert_eq!(
+            pool.buffers.len(),
+            1,
+            "second idle window trims buffers above 32 MiB spare even if a buffer was dropped"
+        );
     }
 }
