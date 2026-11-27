@@ -565,16 +565,21 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             return;
         }
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let old = match resource {
-            Some(r) => kept.insert(index, r),
-            None => kept.remove(&index),
+        #[cfg(feature = "diagnostics")]
+        let new_raw = resource
+            .as_ref()
+            .map(|s| windows::core::Interface::as_raw(&s.0));
+        let old = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            match resource {
+                Some(r) => kept.insert(index, r),
+                None => kept.remove(&index),
+            }
         };
         #[cfg(feature = "diagnostics")]
         if let Some((old, _)) = &old
             && !self.sampler
-            && kept.get(&index).map(|s| windows::core::Interface::as_raw(&s.0))
-                != Some(windows::core::Interface::as_raw(old))
+            && new_raw != Some(windows::core::Interface::as_raw(old))
             // SAFETY: a live resource.
             && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
         {
@@ -689,8 +694,9 @@ impl HostHeap {
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.write_stride(index + 1, 4);
+        let stride = if buffer.is_some() { 4 } else { 0 };
+        self.write_stride(index, stride);
+        self.write_stride(index + 1, stride);
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
@@ -2504,6 +2510,7 @@ mod tests {
         assert!(heap.made.lock().unwrap().is_empty());
         heap.make_null(0);
         heap.raw_view_at(0, None, 0, 0, false);
+        heap.raw_pair_at(2, None, 0);
         assert!(heap.strides.get().is_none());
         assert!(heap.marks.get().is_none());
         assert!(heap.made.lock().unwrap().is_empty());
