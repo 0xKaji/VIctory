@@ -131,10 +131,14 @@ impl SnapshotPool {
 
     fn trim_to(&mut self, max_bytes: usize) {
         self.buffers.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        let mut total = 0;
+        let mut total = 0usize;
         self.buffers.retain(|v| {
-            total += v.capacity();
-            total <= max_bytes
+            if total.saturating_add(v.capacity()) <= max_bytes {
+                total += v.capacity();
+                true
+            } else {
+                false
+            }
         });
     }
 
@@ -1730,5 +1734,20 @@ pub(crate) mod tests {
             1,
             "second idle window trims buffers above 32 MiB spare even if a buffer was dropped"
         );
+    }
+
+    #[test]
+    fn snapshot_pool_trim_to_retains_smaller_buffers_past_oversized() {
+        let mut pool = SnapshotPool {
+            buffers: vec![
+                Vec::with_capacity(64 << 20),
+                Vec::with_capacity(16 << 20),
+                Vec::with_capacity(8 << 20),
+            ],
+            ..SnapshotPool::default()
+        };
+        pool.trim_to(POOL_SPARE_BYTES);
+        let caps: Vec<usize> = pool.buffers.iter().map(Vec::capacity).collect();
+        assert_eq!(caps, [16 << 20, 8 << 20]);
     }
 }
