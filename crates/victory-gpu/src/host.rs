@@ -659,6 +659,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn state_map_trims_after_idle_window() {
+        let (mut peak, mut window) = (0, 0);
+        for _ in 0..STATES_IDLE_RESETS * 2 {
+            assert_eq!(trim_states_capacity(225, 448, &mut peak, &mut window), None);
+        }
+
+        // After a 4,096-entry spike (cap 7,168) followed by 16-entry recordings,
+        // the first 64-reset window keeps the spike and the second shrinks to floor.
+        assert_eq!(trim_states_capacity(4096, 7168, &mut peak, &mut window), None);
+        for _ in 1..STATES_IDLE_RESETS {
+            assert_eq!(trim_states_capacity(16, 7168, &mut peak, &mut window), None);
+        }
+        for _ in 0..STATES_IDLE_RESETS - 1 {
+            assert_eq!(trim_states_capacity(16, 7168, &mut peak, &mut window), None);
+        }
+        assert_eq!(
+            trim_states_capacity(16, 7168, &mut peak, &mut window),
+            Some(STATES_SHRINK_FLOOR)
+        );
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -815,7 +837,7 @@ pub(crate) struct HostList {
     /// submission, in `prelude`. Holding the copies keeps every texture the
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
-    states: Mutex<States>,
+    states: Mutex<StateMap>,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -880,6 +902,13 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+#[derive(Default)]
+struct StateMap {
+    map: States,
+    peak: usize,
+    window: u32,
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -991,6 +1020,23 @@ fn trim_scratch(len: usize, used_chunks: usize, peak_used: &mut usize, window: &
         len.min(keep)
     } else {
         len
+    }
+}
+
+const STATES_SHRINK_CAP: usize = 256;
+const STATES_SHRINK_FLOOR: usize = 64;
+const STATES_IDLE_RESETS: u32 = 64;
+
+fn trim_states_capacity(len: usize, capacity: usize, peak: &mut usize, window: &mut u32) -> Option<usize> {
+    *peak = (*peak).max(len);
+    *window += 1;
+    if *window >= STATES_IDLE_RESETS {
+        let target = (*peak).max(STATES_SHRINK_FLOOR);
+        *peak = 0;
+        *window = 0;
+        (capacity > STATES_SHRINK_CAP && target * 2 <= capacity).then_some(target)
+    } else {
+        None
     }
 }
 
@@ -1820,9 +1866,12 @@ impl HostList {
         *self.deferred() = Deferred::default();
         {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-            states.clear();
-            if states.capacity() > 256 {
-                states.shrink_to(64);
+            let states = &mut *states;
+            let len = states.map.len();
+            let cap = states.map.capacity();
+            states.map.clear();
+            if let Some(target) = trim_states_capacity(len, cap, &mut states.peak, &mut states.window) {
+                states.map.shrink_to(target);
             }
         }
         {
@@ -1903,7 +1952,7 @@ impl HostList {
     /// list's first use (its prelude moves the texture there).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+        match states.map.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
@@ -1999,6 +2048,7 @@ impl HostList {
         // them; only after both do they become the states the list leaves.
         let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
             states
+                .map
                 .values()
                 .filter_map(|(first, _, copy)| {
                     let real = copy.state.load(Ordering::Relaxed);
@@ -2009,11 +2059,11 @@ impl HostList {
                 .collect()
         };
         let left = || {
-            for (_, last, copy) in states.values() {
+            for (_, last, copy) in states.map.values() {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        if copies.is_empty() && states.map.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
             left();
             return None;
         }
@@ -2222,7 +2272,7 @@ impl HostList {
         let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
-            && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.states.lock().unwrap_or_else(|e| e.into_inner()).map.is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
